@@ -85,3 +85,46 @@ function randcat(
     indices = convert.(Int, vec(sum(C .< u'; dims=1))) .+ 1
     return max.(indices, 1)  # prevent numerical issue for Float32
 end
+
+"""
+    or!(x, y)
+
+Compute elementwise OR between `x` and `y` (i.e. `x .| y`), updating `x` in-place if
+possible. Note that if `x` is an `AbstractArray`, then `x .| y` must have the same size as
+`x`.
+"""
+or!(x, y) = x .| y
+or!(x::AbstractArray, y) = x .|= y
+
+"""
+    eitheror!(a, b, tf)
+
+Given a number or array `a`, a number or array `b`, and a boolean or array of booleans `tf`,
+return a number or container containing values of `a` wherever `tf` is true and values of
+`b` wherever `tf` is false.
+
+If `a` is an `AbstractArray`, then the result is stored in `a`, and the dimensions of `a`,
+`b`, and `tf` must be compatible with the output being stored in `a`.
+"""
+@inline eitheror!(a, b, tf) = ifelse.(tf, a, b)
+@inline function eitheror!(a::AbstractArray, b, tf)
+    a .= ifelse.(tf, a, b)
+    return a
+end
+
+@inline accept!(x, x′, is_accept::Bool) = ifelse(is_accept, x′, x)
+@inline accept!(x, x′, is_accept) = eitheror!(x′, x, is_accept)
+@inline function accept!(x::AbstractMatrix, x′::AbstractMatrix, is_accept::AbstractVector)
+    return eitheror!(x′, x, is_accept')
+end
+
+@inline colwise_dot(x::AbstractVector, y::AbstractVector) = dot(x, y)
+# TODO: this function needs a custom GPU kernel, e.g. using KernelAbstractions
+function colwise_dot(x::AbstractMatrix, y::AbstractMatrix)
+    T = Base.promote_eltypeof(x, y)
+    z = similar(x, T, size(x, 2))
+    @inbounds @simd for i in eachindex(z)
+        z[i] = dot(@view(x[:, i]), @view(y[:, i]))
+    end
+    return z
+end

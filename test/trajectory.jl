@@ -1,6 +1,8 @@
 using Test, AdvancedHMC, Random
 using Statistics: mean
 using LinearAlgebra: dot
+using Distributions
+using ForwardDiff
 include("common.jl")
 
 ϵ = 0.01
@@ -279,6 +281,58 @@ end
                 )
                 fig.savefig("seed=$seed.png")
             end
+        end
+    end
+end
+
+@testset "iterative/recursive NUTS regression" begin
+    ℓπ_stdmvnormal(x) = -sum(abs2, x) / 2
+    ℓπ_stdmvnormal(x::AbstractMatrix) = map(ℓπ_stdmvnormal, eachcol(x))
+
+    function ℓπ_nealsfunnel(x)
+        σ = exp(x[1] / 2)
+        return @views -x[1]^2 / 18 - sum(abs2, x[2:end,:]) / σ^2 / 2
+    end
+    ℓπ_nealsfunnel(x::AbstractMatrix) = map(ℓπ_nealsfunnel, eachcol(x))
+
+    ℓπ_stdmvcauchy(x) = -sum(xi -> log1p(xi^2), x)
+    ℓπ_stdmvcauchy(x::AbstractMatrix) = map(ℓπ_stdmvcauchy, eachcol(x))
+
+    test_models = [
+        "standard multivariate normal" => ℓπ_stdmvnormal,
+        "standard multivariate cauchy" => ℓπ_stdmvcauchy, # heavy tails
+        "neal's funnel" => ℓπ_nealsfunnel, # high curvature
+    ]
+
+    @testset "$name" for (name, ℓπ) in test_models
+        D = 10
+        nchains = 1
+        initial_θ = randn(D)
+        n_samples, n_adapts = 1_000, 500
+
+        seeds = rand(UInt, 10)
+        for seed in seeds
+            rng = MersenneTwister(seed)
+            metric = DiagEuclideanMetric(D)
+            hamiltonian = Hamiltonian(metric, ℓπ, ForwardDiff)
+            initial_ϵ = find_good_stepsize(hamiltonian, initial_θ)
+            integrator = Leapfrog(initial_ϵ)
+            adaptor = StanHMCAdaptor(MassMatrixAdaptor(metric), StepSizeAdaptor(0.8, integrator))
+            proposal = NUTS(integrator, 10, 1000.0)
+            samples_recur, stats_recur = sample(deepcopy(rng), hamiltonian, proposal, initial_θ, n_samples, adaptor, n_adapts, verbose = false)
+
+            metric = DiagEuclideanMetric((D,nchains))
+            hamiltonian = Hamiltonian(metric, ℓπ, ForwardDiff)
+            integrator = Leapfrog([initial_ϵ])
+            adaptor = StanHMCAdaptor(MassMatrixAdaptor(metric), StepSizeAdaptor(0.8, integrator))
+            proposal = NUTS(integrator, 10, 1000.0)
+            samples_iter, stats_iter = sample(deepcopy(rng), hamiltonian, proposal, Matrix(reshape(initial_θ, :, 1)), n_samples, adaptor, n_adapts, verbose = false)
+
+            @test map(vec, samples_iter) == samples_recur
+            stats_iter_first = map(stats_iter) do s
+                NamedTuple{keys(s)}(map(first, values(s)))
+            end
+            @test stats_iter_first == stats_recur
         end
     end
 end

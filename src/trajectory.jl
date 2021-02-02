@@ -63,11 +63,11 @@ It contains the slice variable and the number of acceptable condidates in the tr
 
 $(TYPEDFIELDS)
 """
-struct SliceTS{F<:AbstractFloat} <: AbstractTrajectorySampler
+struct SliceTS{FT<:AbstractFloat,T<:AbstractScalarOrVec{FT}} <: AbstractTrajectorySampler
     "Sampled candidate `PhasePoint`."
     zcand   ::  PhasePoint
     "Slice variable in log-space."
-    ℓu      ::  F
+    ℓu      ::  T
     "Number of acceptable candidates, i.e. those with probability larger than slice variable `u`."
     n       ::  Int
 end
@@ -84,11 +84,11 @@ It contains the weight of the tree, defined as the total probabilities of the le
 
 $(TYPEDFIELDS)
 """
-struct MultinomialTS{F<:AbstractFloat} <: AbstractTrajectorySampler
+struct MultinomialTS{FT<:AbstractFloat,T<:AbstractScalarOrVec{FT}} <: AbstractTrajectorySampler
     "Sampled candidate `PhasePoint`."
     zcand   ::  PhasePoint
     "Total energy for the given tree, i.e. the sum of energies of all leaves."
-    ℓw      ::  F
+    ℓw      ::  T
 end
 
 """
@@ -110,30 +110,42 @@ Ref: https://github.com/stan-dev/stan/blob/develop/src/stan/mcmc/hmc/nuts/base_n
 MultinomialTS(rng::AbstractRNG, z0::PhasePoint) = MultinomialTS(z0, zero(energy(z0)))
 
 """
-    SliceTS(s::SliceTS, H0::AbstractFloat, zcand::PhasePoint)
+    SliceTS(s::SliceTS, H0::AbstractScalarOrVec{<:AbstractFloat}, zcand::PhasePoint)
 
 Create a slice sampler for a single leaf tree:
 - the slice variable is copied from the passed-in sampler `s` and
 - the number of acceptable candicates is computed by comparing the slice variable against the current energy.
 """
-function SliceTS(s::SliceTS, H0::AbstractFloat, zcand::PhasePoint)
-    return SliceTS(zcand, s.ℓu, (s.ℓu <= -energy(zcand)) ? 1 : 0)
+function SliceTS(s::SliceTS, H0::AbstractScalarOrVec{<:AbstractFloat}, zcand::PhasePoint)
+    return SliceTS(zcand, s.ℓu, ifelse.(s.ℓu .<= .-energy(zcand), 1, 0))
 end
 
 """
-    MultinomialTS(s::MultinomialTS, H0::AbstractFloat, zcand::PhasePoint)
+    MultinomialTS(s::MultinomialTS, H0::AbstractScalarOrVec{<:AbstractFloat}, zcand::PhasePoint)
 
 Multinomial sampler for a trajectory consisting only a leaf node.
 - tree weight is the (unnormalised) energy of the leaf.
 """
-function MultinomialTS(s::MultinomialTS, H0::AbstractFloat, zcand::PhasePoint)
-    return MultinomialTS(zcand, H0 - energy(zcand))
+function MultinomialTS(s::MultinomialTS, H0::AbstractScalarOrVec{<:AbstractFloat}, zcand::PhasePoint)
+    return MultinomialTS(zcand, H0 .- energy(zcand))
 end
 
-function combine(rng::AbstractRNG, s1::SliceTS, s2::SliceTS)
+function combine(rng::AbstractRNG, s1::SliceTS{FT,FT}, s2::SliceTS{FT,FT}) where {FT<:AbstractFloat}
     @assert s1.ℓu == s2.ℓu "Cannot combine two slice sampler with different slice variable"
     n = s1.n + s2.n
     zcand = rand(rng) < s1.n / n ? s1.zcand : s2.zcand
+    return SliceTS(zcand, s1.ℓu, n)
+end
+function combine(rng::AbstractRNG, s1::SliceTS, s2::SliceTS)
+    @assert s1.ℓu == s2.ℓu "Cannot combine two slice sampler with different slice variable"
+    n = s1.n + s2.n
+    # ensure is_accept size matches s1.ℓu
+    α = s1.n / n
+    is_accept = broadcast(s1.ℓu) do _
+        rand(rng) < α
+    end
+    zcand = deepcopy(s1.zcand)
+    zcand = accept!(s2.zcand, zcand, is_accept)
     return SliceTS(zcand, s1.ℓu, n)
 end
 
@@ -143,21 +155,49 @@ function combine(zcand::PhasePoint, s1::SliceTS, s2::SliceTS)
     return SliceTS(zcand, s1.ℓu, n)
 end
 
-function combine(rng::AbstractRNG, s1::MultinomialTS, s2::MultinomialTS)
+function accept!(
+    s::SliceTS,
+    s′::SliceTS,
+    is_accept::AbstractVector{Bool}
+)
+    zcand = accept!(s.zcand, s′.zcand, is_accept)
+    ℓu = accept!(s.ℓu, s′.ℓu, is_accept)
+    n = accept!(s.n, s′.n, is_accept)
+    return SliceTS(zcand, ℓu, n)
+end
+
+function combine(rng::AbstractRNG, s1::MultinomialTS{FT,FT}, s2::MultinomialTS{FT,FT}) where {FT<:AbstractFloat}
     ℓw = logaddexp(s1.ℓw, s2.ℓw)
     zcand = rand(rng) < exp(s1.ℓw - ℓw) ? s1.zcand : s2.zcand
     return MultinomialTS(zcand, ℓw)
 end
-
-function combine(zcand::PhasePoint, s1::MultinomialTS, s2::MultinomialTS)
-    ℓw = logaddexp(s1.ℓw, s2.ℓw)
+function combine(rng::AbstractRNG, s1::MultinomialTS, s2::MultinomialTS)
+    ℓw = logaddexp.(s1.ℓw, s2.ℓw)
+    is_accept = rand.(rng) .< exp.(s1.ℓw .- ℓw)
+    zcand = deepcopy(s1.zcand)
+    zcand = accept!(s2.zcand, zcand, is_accept)
     return MultinomialTS(zcand, ℓw)
 end
 
-mh_accept(rng::AbstractRNG, s::SliceTS, s′::SliceTS) = rand(rng) < min(1, s′.n / s.n)
+function combine(zcand::PhasePoint, s1::MultinomialTS, s2::MultinomialTS)
+    ℓw = logaddexp.(s1.ℓw, s2.ℓw)
+    return MultinomialTS(zcand, ℓw)
+end
+
+function accept!(
+    s::MultinomialTS,
+    s′::MultinomialTS,
+    is_accept::AbstractVector{Bool}
+)
+    zcand = accept!(s.zcand, s′.zcand, is_accept)
+    ℓw = accept!(s.ℓw, s′.ℓw, is_accept)
+    return MultinomialTS(zcand, ℓw)
+end
+
+mh_accept(rng::AbstractRNG, s::SliceTS, s′::SliceTS) = rand.(rng) .< min(1, s′.n / s.n)
 
 function mh_accept(rng::AbstractRNG, s::MultinomialTS, s′::MultinomialTS)
-    return rand(rng) < min(1, exp(s′.ℓw - s.ℓw))
+    return rand.(rng) .< min.(1, exp.(s′.ℓw .- s.ℓw))
 end
 
 """
@@ -218,7 +258,7 @@ function transition(
 
     z′, is_accept, α = sample_phasepoint(rng, τ, h, z)
     # Do the actual accept / reject
-    z = accept_phasepoint!(z, z′, is_accept)    # NOTE: this function changes `z′` in place in matrix-parallel mode
+    z = accept!(z, z′, is_accept)    # NOTE: this function changes `z′` in place in matrix-parallel mode
     # Reverse momentum variable to preserve reversibility
     z = PhasePoint(z.θ, -z.r, z.ℓπ, z.ℓκ)
     H = energy(z)
@@ -234,32 +274,6 @@ function transition(
         stat(integrator),
     )
     return Transition(z, tstat)
-end
-
-# Return the accepted phase point
-function accept_phasepoint!(z::T, z′::T, is_accept::Bool) where {T<:PhasePoint{<:AbstractVector}}
-    if is_accept
-        return z′
-    else
-        return z
-    end
-end
-function accept_phasepoint!(z::T, z′::T, is_accept) where {T<:PhasePoint{<:AbstractMatrix}}
-    # Revert unaccepted proposals in `z′`
-    is_reject = (!).(is_accept)
-    if any(is_reject)
-        z′.θ[:,is_reject] = z.θ[:,is_reject]
-        z′.r[:,is_reject] = z.r[:,is_reject]
-        z′.ℓπ.value[is_reject] = z.ℓπ.value[is_reject]
-        z′.ℓπ.gradient[:,is_reject] = z.ℓπ.gradient[:,is_reject]
-        z′.ℓκ.value[is_reject] = z.ℓκ.value[is_reject]
-        z′.ℓκ.gradient[:,is_reject] = z.ℓκ.gradient[:,is_reject]
-    end
-    # Always return `z′` as any unaccepted proposal is already reverted
-    # NOTE: This in place treatment of `z′` is for memory efficient consideration.
-    #       We can also copy `z′ and avoid mutating the original `z′`. But this is
-    #       not efficient and immutability of `z′` is not important in this local scope.
-    return z′
 end
 
 ### Use end-point from the trajectory as a proposal and apply MH correction
@@ -403,7 +417,7 @@ $(TYPEDFIELDS)
 # References
 1. Betancourt, M. (2017). A Conceptual Introduction to Hamiltonian Monte Carlo. [arXiv preprint arXiv:1701.02434](https://arxiv.org/abs/1701.02434).
 """
-struct GeneralisedNoUTurn{T<:AbstractVector{<:Real}} <: AbstractTerminationCriterion
+struct GeneralisedNoUTurn{T<:AbstractVecOrMat{<:Real}} <: AbstractTerminationCriterion
     "Integral or sum of momenta along the integration path."
     rho::T
 end
@@ -424,7 +438,7 @@ $(TYPEDFIELDS)
 1. Betancourt, M. (2017). A Conceptual Introduction to Hamiltonian Monte Carlo. [arXiv preprint arXiv:1701.02434](https://arxiv.org/abs/1701.02434).
 2. [https://github.com/stan-dev/stan/pull/2800](https://github.com/stan-dev/stan/pull/2800)
 """
-struct StrictGeneralisedNoUTurn{T<:AbstractVector{<:Real}} <: AbstractTerminationCriterion
+struct StrictGeneralisedNoUTurn{T<:AbstractVecOrMat{<:Real}} <: AbstractTerminationCriterion
     "Integral or sum of momenta along the integration path."
     rho::T
 end
@@ -435,6 +449,20 @@ combine(::ClassicNoUTurn, ::ClassicNoUTurn) = ClassicNoUTurn()
 combine(cleft::T, cright::T) where {T<:GeneralisedNoUTurn} = T(cleft.rho + cright.rho)
 combine(cleft::T, cright::T) where {T<:StrictGeneralisedNoUTurn} = T(cleft.rho + cright.rho)
 
+@inline accept!(
+    ::ClassicNoUTurn,
+    ::ClassicNoUTurn,
+    is_accept::AbstractVector{Bool},
+) = ClassicNoUTurn()
+
+@inline function accept!(
+    c::CT,
+    c′::CT,
+    is_accept::AbstractVector{Bool}
+) where {T<:AbstractMatrix{<:Real},CT<:Union{GeneralisedNoUTurn{T},StrictGeneralisedNoUTurn{T}}}
+    accept!(c.rho, c′.rho, is_accept)
+    return c′
+end
 
 ##
 ## NUTS
@@ -510,31 +538,43 @@ Termination reasons
 - `dynamic`: due to stoping criteria
 - `numerical`: due to large energy deviation from starting (possibly numerical errors)
 """
-struct Termination
-    dynamic::Bool
-    numerical::Bool
+struct Termination{T<:Union{Bool,AbstractVector{Bool}}}
+    dynamic::T
+    numerical::T
 end
 
 Base.show(io::IO, d::Termination) = print(io, "Termination(dynamic=$(d.dynamic), numerical=$(d.numerical))")
-Base.:*(d1::Termination, d2::Termination) = Termination(d1.dynamic || d2.dynamic, d1.numerical || d2.numerical)
-isterminated(d::Termination) = d.dynamic || d.numerical
+Base.:*(d1::Termination, d2::Termination) = Termination(d1.dynamic .| d2.dynamic, d1.numerical .| d2.numerical)
+isterminated(d::Termination) = d.dynamic .| d.numerical
 
 """
-    Termination(s::SliceTS, nt::NUTS, H0::F, H′::F) where {F<:AbstractFloat}
+    Termination(s::SliceTS, nt::NUTS, H0, H′)
 
 Check termination of a Hamiltonian trajectory.
 """
-function Termination(s::SliceTS, nt::NUTS, H0::F, H′::F) where {F<:AbstractFloat}
-    return Termination(false, !(s.ℓu < nt.Δ_max + -H′))
+function Termination(s::SliceTS, nt::NUTS, H0, H′)
+    numerical = .!(s.ℓu .< nt.Δ_max .- H′)
+    return Termination(zero(numerical), numerical)
 end
 
 """
-    Termination(s::MultinomialTS, nt::NUTS, H0::F, H′::F) where {F<:AbstractFloat}
+    Termination(s::MultinomialTS, nt::NUTS, H0, H′)
 
 Check termination of a Hamiltonian trajectory.
 """
-function Termination(s::MultinomialTS, nt::NUTS, H0::F, H′::F) where {F<:AbstractFloat}
-    return Termination(false, !(-H0 < nt.Δ_max + -H′))
+function Termination(s::MultinomialTS, nt::NUTS, H0, H′)
+    numerical = .!(.-H0 .< nt.Δ_max .- H′)
+    return Termination(zero(numerical), numerical)
+end
+
+@inline function accept!(
+    termination::TT,
+    termination′::TT,
+    is_accept::AbstractVector{Bool}
+) where {T<:AbstractVector{Bool},TT<:Termination{T}}
+    accept!(termination.dynamic, termination′.dynamic, is_accept)
+    accept!(termination.numerical, termination′.numerical, is_accept)
+    return termination′
 end
 
 """
@@ -569,8 +609,25 @@ function combine(treeleft::BinaryTree, treeright::BinaryTree)
         combine(treeleft.c, treeright.c),
         treeleft.sum_α + treeright.sum_α,
         treeleft.nα + treeright.nα,
-        maxabs(treeleft.ΔH_max, treeright.ΔH_max),
+        maxabs.(treeleft.ΔH_max, treeright.ΔH_max),
     )
+end
+
+function accept!(
+    tree::BinaryTree,
+    tree′::BinaryTree,
+    is_accept::AbstractVector{Bool}
+)
+    if any(!, is_accept)
+        zleft = accept!(tree.zleft, tree′.zleft, is_accept)
+        zright = accept!(tree.zright, tree′.zright, is_accept)
+        c = accept!(tree.c, tree′.c, is_accept)
+        sum_α = accept!(tree.sum_α, tree′.sum_α, is_accept)
+        nα = accept!(tree.nα, tree′.nα, is_accept)
+        ΔH_max = accept!(tree.ΔH_max, tree′.ΔH_max, is_accept)
+        tree′ = BinaryTree(zleft, zright, c, sum_α, nα, ΔH_max)
+    end
+    return tree′
 end
 
 """
@@ -585,8 +642,8 @@ function isterminated(h::Hamiltonian, t::BinaryTree{<:ClassicNoUTurn})
     # z0 is starting point and z1 is ending point
     z0, z1 = t.zleft, t.zright
     Δθ = z1.θ - z0.θ
-    s = (dot(Δθ, ∂H∂r(h, -z0.r)) >= 0) || (dot(-Δθ, ∂H∂r(h, z1.r)) >= 0)
-    return Termination(s, false)
+    s = (colwise_dot(Δθ, ∂H∂r(h, -z0.r)) .>= 0) .| (colwise_dot(-Δθ, ∂H∂r(h, z1.r)) .>= 0)
+    return Termination(s, zero(s))
 end
 
 """
@@ -600,7 +657,7 @@ Ref: https://arxiv.org/abs/1701.02434
 function isterminated(h::Hamiltonian, t::BinaryTree{<:GeneralisedNoUTurn})
     rho = t.c.rho
     s = generalised_uturn_criterion(rho, ∂H∂r(h, t.zleft.r), ∂H∂r(h, t.zright.r))
-    return Termination(s, false)
+    return Termination(s, zero(s))
 end
 
 """
@@ -648,7 +705,7 @@ function check_left_subtree(
 ) where {T<:BinaryTree{<:StrictGeneralisedNoUTurn}}
     rho = tleft.c.rho + tright.zleft.r
     s = generalised_uturn_criterion(rho, ∂H∂r(h, t.zleft.r), ∂H∂r(h, tright.zleft.r))
-    return Termination(s, false)
+    return Termination(s, zero(s))
 end
 
 """
@@ -664,15 +721,124 @@ function check_right_subtree(
 ) where {T<:BinaryTree{<:StrictGeneralisedNoUTurn}}
     rho = tleft.zright.r + tright.c.rho
     s = generalised_uturn_criterion(rho, ∂H∂r(h, tleft.zright.r), ∂H∂r(h, t.zright.r))
-    return Termination(s, false)
+    return Termination(s, zero(s))
 end
 
 function generalised_uturn_criterion(rho, p_sharp_minus, p_sharp_plus)
-    return (dot(rho, p_sharp_minus) <= 0) || (dot(rho, p_sharp_plus) <= 0)
+    return (colwise_dot(rho, p_sharp_minus) .<= 0) .| (colwise_dot(rho, p_sharp_plus) .<= 0)
 end
 
 function isterminated(h::Hamiltonian, t::BinaryTree{T}, args...) where {T<:Union{ClassicNoUTurn, GeneralisedNoUTurn}}
     return isterminated(h, t)
+end
+
+struct TreeState{T,S,TC}
+    tree::T
+    sampler::S
+    termination::TC
+end
+
+@inline isterminated(state::TreeState) = isterminated(state.termination)
+
+function accept!(
+    state::TreeState,
+    state′::TreeState,
+    is_accept::AbstractVector{Bool}
+)
+    if any(!, is_accept)
+        tree′ = accept!(state.tree, state′.tree, is_accept)
+        sampler′ = accept!(state.sampler, state′.sampler, is_accept)
+        termination′ = accept!(state.termination, state′.termination, is_accept)
+        state′ = TreeState(tree′, sampler′, termination′)
+    end
+    return state′
+end
+
+"""
+Combine `state` and `state′` for all chains where `state` has not terminated.
+"""
+function combine(rng::AbstractRNG, h::Hamiltonian, state::TreeState, state′::TreeState, v)
+    treeleft, treeright = left_right_subtrees(state.tree, state′.tree, v)
+    tree′ = combine(treeleft, treeright)
+    sampler′ = combine(rng, state.sampler, state′.sampler)
+    termination′ = state.termination * state′.termination * isterminated(h, tree′, treeleft, treeright)
+    state′ = TreeState(tree′, sampler′, termination′)
+    is_accept = .!isterminated(state)
+    state′ = accept!(state, state′, is_accept)
+    return state′
+end
+
+"""
+Combine `state` and `state′` with candidate point `zcand` for all chains where `state` has
+not terminated.
+"""
+function combine(zcand::PhasePoint, h::Hamiltonian, state::TreeState, state′::TreeState, v)
+    treeleft, treeright = left_right_subtrees(state.tree, state′.tree, v)
+    tree′ = combine(treeleft, treeright)
+    sampler′ = combine(zcand, state.sampler, state′.sampler)
+    termination′ = state.termination * state′.termination * isterminated(h, tree′, treeleft, treeright)
+    state′ = TreeState(tree′, sampler′, termination′)
+    is_accept = .!isterminated(state)
+    state′ = accept!(state, state′, is_accept)
+    return state′
+end
+
+"""
+Create a level 0 `TreeState` at the initial point `z0`.
+"""
+function init_tree_state(rng::AbstractRNG, τ::NUTS{S,C}, z0::PhasePoint) where {S,C}
+    H0 = energy(z0)
+    tree = BinaryTree(z0, z0, C(z0), zero(H0), map(_ -> 0, H0), zero(H0))
+    sampler = S(rng, z0)
+    # to get same type of array as boolean check
+    term = H0 .> Inf
+    termination = Termination(term, deepcopy(term))
+    state = TreeState(tree, sampler, termination)
+    return state
+end
+
+function build_one_leaf_tree(nt::NUTS{S,C}, h, z, sampler, v, H0) where {S,C}
+    z′ = step(nt.integrator, h, z, 1; fwd = v .> 0)
+    H′ = energy(z′)
+    ΔH = H′ - H0
+    α′ = exp.(min.(0, .-ΔH))
+    tree′ = BinaryTree(z′, z′, C(z′), α′, map(_ -> 1, v), ΔH)
+    sampler′ = S(sampler, H0, z′)
+    termination′ = Termination(sampler′, nt, H0, H′)
+    return z′, TreeState(tree′, sampler′, termination′)
+end
+
+"""
+    subtree_cache_combine_range(ileaf::Integer) -> UnitRange
+
+Get the indices of the cached trees that need to be combined with the two-leaf tree produced
+at even leaf number `ileaf`.
+"""
+@inline function subtree_cache_combine_range(ileaf)
+    imin = count_ones(ileaf)
+    inum = trailing_zeros(ileaf)
+    return (imin + inum - 1):-1:imin
+end
+
+function tree_extension_phasepoint(tree, v::Int)
+    return v == -1 ? tree.zleft : tree.zright
+end
+function tree_extension_phasepoint(tree, v)
+    isright = isone.(v)
+    z′ = deepcopy(tree.zright)
+    z′ = accept!(tree.zleft, z′, isright)
+    return z′
+end
+
+function left_right_subtrees(tree, tree′, v::Int)
+    return v == -1 ? (tree′, tree) : (tree, tree′)
+end
+function left_right_subtrees(tree, tree′, v)
+    tree_left, tree_right = deepcopy(tree), deepcopy(tree′)
+    is_accept = isone.(v)
+    tree_right = accept!(tree, tree_right, is_accept)
+    tree_left = accept!(tree′, tree_left, is_accept)
+    return tree_left, tree_right
 end
 
 """
@@ -680,99 +846,186 @@ Recursivly build a tree for a given depth `j`.
 """
 function build_tree(
     rng::AbstractRNG,
-    nt::NUTS{S,C,I,F},
+    nt::NUTS,
     h::Hamiltonian,
     z::PhasePoint,
     sampler::AbstractTrajectorySampler,
     v::Int,
     j::Int,
     H0::AbstractFloat,
-) where {I<:AbstractIntegrator,F<:AbstractFloat,S<:AbstractTrajectorySampler,C<:AbstractTerminationCriterion}
+)
     if j == 0
         # Base case - take one leapfrog step in the direction v.
-        z′ = step(nt.integrator, h, z, v)
-        H′ = energy(z′)
-        ΔH = H′ - H0
-        α′ = exp(min(0, -ΔH))
-        sampler′ = S(sampler, H0, z′)
-        return BinaryTree(z′, z′, C(z′), α′, 1, ΔH), sampler′, Termination(sampler′, nt, H0, H′)
+        _, state′ = build_one_leaf_tree(nt, h, z, sampler, v, H0)
+        return state′
     else
         # Recursion - build the left and right subtrees.
-        tree′, sampler′, termination′ = build_tree(rng, nt, h, z, sampler, v, j - 1, H0)
+        state′ = build_tree(rng, nt, h, z, sampler, v, j - 1, H0)
         # Expand tree if not terminated
-        if !isterminated(termination′)
-            # Expand left
-            if v == -1
-                tree′′, sampler′′, termination′′ = build_tree(rng, nt, h, tree′.zleft, sampler, v, j - 1, H0) # left tree
-                treeleft, treeright = tree′′, tree′
-            # Expand right
-            else
-                tree′′, sampler′′, termination′′ = build_tree(rng, nt, h, tree′.zright, sampler, v, j - 1, H0) # right tree
-                treeleft, treeright = tree′, tree′′
-            end
-            tree′ = combine(treeleft, treeright)
-            sampler′ = combine(rng, sampler′, sampler′′)
-            termination′ = termination′ * termination′′ * isterminated(h, tree′, treeleft, treeright)
+        if !isterminated(state′)
+            zextend = tree_extension_phasepoint(state′.tree, v)
+            state′′ = build_tree(rng, nt, h, zextend, sampler, v, j - 1, H0)
+            state′ = combine(rng, h, state′, state′′, v)
         end
-        return tree′, sampler′, termination′
+        return state′
     end
+end
+
+"""
+Iteratively build a tree for a given depth `j`.
+"""
+function build_tree(
+    rng::AbstractRNG,
+    nt::NUTS,
+    h::Hamiltonian,
+    z::PhasePoint{<:AbstractMatrix{<:AbstractFloat}},
+    sampler::AbstractTrajectorySampler,
+    v::AbstractVector{Int},
+    j::Int,
+    H0::AbstractVector{<:AbstractFloat},
+)
+    ileaf_max = 2^j
+    state_cache_size = j
+
+    z′, state′ = build_one_leaf_tree(nt, h, z, sampler, v, H0)
+    j == 0 && return state′
+
+    has_terminated = isterminated(state′)
+
+    # TODO: allocate state_cache in `transition` and reuse for all subtrees
+    state_cache = Vector{typeof(state′)}(undef, state_cache_size)
+    icache = 1
+    ileaf = 1
+    while ileaf < ileaf_max && any(!, has_terminated)
+        # cache previous state for future checks
+        @inbounds state_cache[icache] = state′
+
+        # take a single step
+        z′, state′ = build_one_leaf_tree(nt, h, z′, state′.sampler, v, H0)
+        ileaf += 1
+
+        # combine with cached subtrees with same number of leaves
+        combine_range = subtree_cache_combine_range(ileaf)
+        for i in combine_range
+            @inbounds state′ = combine(rng, h, state_cache[i], state′, v)
+        end
+        icache = last(combine_range)
+        has_terminated .|= isterminated(state′)
+    end
+
+    # combine even if not same number of leaves
+    # this only executes if the above loop was terminated prematurely
+    for i in (icache - 1):-1:1
+        @inbounds state′ = combine(rng, h, state_cache[i], state′, v)
+    end
+
+    return state′
 end
 
 function transition(
     rng::AbstractRNG,
-    τ::NUTS{S,C,I,F},
+    τ::NUTS,
     h::Hamiltonian,
     z0::PhasePoint,
-) where {I<:AbstractIntegrator,F<:AbstractFloat,S<:AbstractTrajectorySampler,C<:AbstractTerminationCriterion}
+)
+    state = init_tree_state(rng, τ, z0)
     H0 = energy(z0)
-    tree = BinaryTree(z0, z0, C(z0), zero(F), zero(Int), zero(H0))
-    sampler = S(rng, z0)
-    termination = Termination(false, false)
     zcand = z0
 
     integrator = jitter(rng, τ.integrator)
     τ = reconstruct(τ, integrator=integrator)
 
     j = 0
-    while !isterminated(termination) && j < τ.max_depth
+    while !isterminated(state) && j < τ.max_depth
         # Sample a direction; `-1` means left and `1` means right
         v = rand(rng, [-1, 1])
-        if v == -1
-            # Create a tree with depth `j` on the left
-            tree′, sampler′, termination′ = build_tree(rng, τ, h, tree.zleft, sampler, v, j, H0)
-            treeleft, treeright = tree′, tree
-        else
-            # Create a tree with depth `j` on the right
-            tree′, sampler′, termination′ = build_tree(rng, τ, h, tree.zright, sampler, v, j, H0)
-            treeleft, treeright = tree, tree′
-        end
+        # get point from which next tree is extended
+        zextend = tree_extension_phasepoint(state.tree, v)
+        # Create a tree with depth `j` from `zextend`
+        state′ = build_tree(rng, τ, h, zextend, state.sampler, v, j, H0)
+
         # Perform a MH step and increse depth if not terminated
-        if !isterminated(termination′)
+        # this check is performed even if unneeded for consistency with iterative NUTS
+        is_accept = mh_accept(rng, state.sampler, state′.sampler)
+        if !isterminated(state′)
             j = j + 1   # increment tree depth
-            if mh_accept(rng, sampler, sampler′)
-                zcand = sampler′.zcand
+            if is_accept
+                zcand = state′.sampler.zcand
             end
         end
-        # Combine the proposed tree and the current tree (no matter terminated or not)
-        tree = combine(treeleft, treeright)
-        # Update sampler
-        sampler = combine(zcand, sampler, sampler′)
-        # update termination
-        termination = termination * termination′ * isterminated(h, tree, treeleft, treeright)
+
+        # Combine the proposed state and the current state (no matter terminated or not)
+        state = combine(zcand, h, state, state′, v)
     end
 
     H = energy(zcand)
     tstat = merge(
         (
-            n_steps=tree.nα,
+            n_steps=state.tree.nα,
             is_accept=true,
-            acceptance_rate=tree.sum_α / tree.nα,
+            acceptance_rate=state.tree.sum_α / state.tree.nα,
             log_density=zcand.ℓπ.value,
             hamiltonian_energy=H,
             hamiltonian_energy_error=H - H0,
-            max_hamiltonian_energy_error=tree.ΔH_max,
+            max_hamiltonian_energy_error=state.tree.ΔH_max,
             tree_depth=j,
-            numerical_error=termination.numerical,
+            numerical_error=state.termination.numerical,
+        ),
+        stat(τ.integrator),
+    )
+
+    return Transition(zcand, tstat)
+end
+
+function transition(
+    rng::AbstractRNG,
+    τ::NUTS,
+    h::Hamiltonian,
+    z0::PhasePoint{<:AbstractMatrix{<:AbstractFloat}},
+)
+    state = init_tree_state(rng, τ, z0)
+    H0 = energy(z0)
+    zcand = deepcopy(z0)
+
+    integrator = jitter(rng, τ.integrator)
+    τ = reconstruct(τ, integrator=integrator)
+
+    j = 0
+    tree_depth = map(_ -> j, H0)
+    has_terminated = isterminated(state)
+    while j < τ.max_depth && any(!, has_terminated)
+        # Sample a direction; `-1` means left and `1` means right
+        v = map(_ -> rand(rng, [-1, 1]), H0)
+        # get point from which next tree is extended
+        zextend = tree_extension_phasepoint(state.tree, v)
+        # Create a tree with depth `j` from `zextend`
+        state′ = build_tree(rng, τ, h, zextend, state.sampler, v, j, H0)
+        j = j + 1   # increment tree depth
+
+        has_terminated = or!(has_terminated, isterminated(state′))
+        # increase tree depth if still hasn't yet terminated
+        tree_depth .+= .!has_terminated
+        # never accept a proposal from a subtree that has already terminated
+        is_reject = has_terminated .| .!mh_accept(rng, state.sampler, state′.sampler)
+        zcand′ = state′.sampler.zcand
+        zcand = accept!(zcand′, zcand, is_reject)
+
+        state = combine(zcand, h, state, state′, v)
+        has_terminated = or!(has_terminated, isterminated(state))
+    end
+
+    H = energy(zcand)
+    tstat = merge(
+        (
+            n_steps=state.tree.nα,
+            is_accept=true,
+            acceptance_rate=state.tree.sum_α ./ state.tree.nα,
+            log_density=zcand.ℓπ.value,
+            hamiltonian_energy=H,
+            hamiltonian_energy_error=H - H0,
+            max_hamiltonian_energy_error=state.tree.ΔH_max,
+            tree_depth=tree_depth,
+            numerical_error=state.termination.numerical,
         ),
         stat(τ.integrator),
     )
