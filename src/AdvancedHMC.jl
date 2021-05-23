@@ -132,8 +132,13 @@ include("sampler.jl")
 export sample
 
 include("abstractmcmc.jl")
+export HMCSampler, DifferentiableDensityModel
 
 include("contrib/ad.jl")
+
+import MCMCTempering
+include("tempering.jl")
+export make_tempered_model, make_tempered_logπ, get_θ
 
 ### Init
 
