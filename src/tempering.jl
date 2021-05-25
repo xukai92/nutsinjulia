@@ -2,11 +2,32 @@
 #   MODEL
 #####################
 
+struct Joint{Tℓprior, Tℓll} <: Function
+    ℓprior      :: Tℓprior
+    ℓlikelihood :: Tℓll
+end
+
+function (joint::Joint)(θ)
+    return joint.ℓprior(θ) .+ joint.ℓlikelihood(θ)
+end
+
+
+struct TemperedJoint{Tℓprior, Tℓll, T<:AbstractFloat} <: Function
+    ℓprior      :: Tℓprior
+    ℓlikelihood :: Tℓll
+    β           :: T
+end
+
+function (tj::TemperedJoint)(θ)
+    return tj.ℓprior(θ) .+ (tj.ℓlikelihood(θ) .* tj.β)
+end
+
+
 function MCMCTempering.make_tempered_model(model::DifferentiableDensityModel, β::T) where {T<:AbstractFloat}
-    ℓπ_β(θ) = model.ℓπ(θ) * β
-    ∂ℓπ∂θ_β(θ) = model.∂ℓπ∂θ(θ) * β
-    model = DifferentiableDensityModel(ℓπ_β, ∂ℓπ∂θ_β)
-    return model
+    ℓπ_β = TemperedJoint(model.ℓπ.ℓprior, model.ℓπ.ℓlikelihood, β)
+    ∂ℓπ∂θ_β = TemperedJoint(model.∂ℓπ∂θ.ℓprior, model.∂ℓπ∂θ.ℓlikelihood, β)
+    model_β = DifferentiableDensityModel(ℓπ_β, ∂ℓπ∂θ_β)
+    return model_β
 end
 
 
@@ -23,6 +44,6 @@ function MCMCTempering.make_tempered_logπ(model::DifferentiableDensityModel, β
 end
 
 
-function MCMCTempering.get_θ(state::HMCState)
-    return state.z.θ
+function MCMCTempering.get_θ(trans::Transition)
+    return trans.z.θ
 end
