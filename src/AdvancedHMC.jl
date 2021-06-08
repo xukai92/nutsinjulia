@@ -138,7 +138,7 @@ include("contrib/ad.jl")
 
 import MCMCTempering
 include("tempering.jl")
-export Joint, TemperedJoint, make_tempered_model, make_tempered_logπ, get_θ
+export Joint
 
 ### Init
 
